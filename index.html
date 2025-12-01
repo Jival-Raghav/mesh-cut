@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <title>Robust Cloth Cutter</title>
+  <style>
+    body {
+      margin: 0;
+      background: #0f172a;
+      overflow: hidden;
+      font-family: sans-serif;
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      cursor: crosshair;
+    }
+
+    .ui {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      background: rgba(15, 23, 42, 0.9);
+      color: #38bdf8;
+      padding: 15px;
+      border-radius: 8px;
+      pointer-events: none;
+      border: 1px solid #334155;
+      user-select: none;
+    }
+
+    .val {
+      color: white;
+      font-weight: bold;
+      margin-left: 10px;
+    }
+  </style>
+</head>
+
+<body>
+
+  <div class="ui">
+    <div>Vertices <span id="v" class="val">0</span></div>
+    <div>Triangles <span id="t" class="val">0</span></div>
+    <div style="margin-top:10px; font-size:12px; color:#94a3b8">
+      Hover to Refine • Click to Cut
+    </div>
+  </div>
+  <canvas id="c"></canvas>
+
+  <script>
+    const CONFIG = {
+      gravity: 1000,
+      physicsIterations: 16,
+      refineRadius: 40,
+      cutRadius: 20,
+      minEdgeLength: 8,
+      tearThreshold: 70,
+      spacing: 30
+    };
+
+    // HELPER: Linear Interpolation
+    const lerp = (start, end, t) => start + (end - start) * t;
+
+    const Vec2 = {
+      dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y),
+    };
+
+    class Point {
+      constructor(x, y, pinned = false) {
+        this.x = x; this.y = y;
+        this.oldx = x; this.oldy = y;
+        this.pinned = pinned;
+        this.id = Point.idCounter++;
+      }
+    }
+    Point.idCounter = 0;
+
+    class Constraint {
+      constructor(p1, p2) {
+        this.p1 = p1;
+        this.p2 = p2;
+        this.length = Vec2.dist(p1, p2);
+        this.active = true;
+        this.midpoint = null;
+      }
+
+      solve() {
+        if (!this.active) return;
+        const dx = this.p1.x - this.p2.x;
+        const dy = this.p1.y - this.p2.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+
+        if (dist < 0.001) return;
+
+        const diff = (dist - this.length) / dist;
+        const correction = Math.min(Math.max(diff * 0.5, -0.5), 0.5);
+        const offX = dx * correction;
+        const offY = dy * correction;
+
+        if (!this.p1.pinned) { this.p1.x -= offX; this.p1.y -= offY; }
+        if (!this.p2.pinned) { this.p2.x += offX; this.p2.y += offY; }
+      }
+    }
+
+    class Triangle {
+      constructor(p1, p2, p3, gen = 0) {
+        this.p1 = p1; this.p2 = p2; this.p3 = p3;
+        this.active = true;
+        this.generation = gen;
+        this.colorVal = 200 + Math.random() * 30;
+      }
+
+      centroid() {
+        return {
+          x: (this.p1.x + this.p2.x + this.p3.x) / 3,
+          y: (this.p1.y + this.p2.y + this.p3.y) / 3
+        };
+      }
+    }
+
+    class ClothSim {
+      constructor(canvas) {
+        this.c = canvas;
+        this.ctx = canvas.getContext('2d');
+        this.points = [];
+        this.constraints = [];
+        this.constraintMap = new Map();
+        this.midpointMap = new Map(); // Added midpointMap
+        this.triangles = [];
+
+        this.mouse = { x: 0, y: 0, px: 0, py: 0, down: false };
+        this.width = 0; this.height = 0;
+
+        this.resize();
+        this.initMesh();
+        this.bindEvents();
+        this.loop();
+      }
+
+      resize() {
+        this.width = this.c.width = window.innerWidth;
+        this.height = this.c.height = window.innerHeight;
+      }
+
+      getEdgeKey(p1, p2) {
+        return p1.id < p2.id ? `${p1.id}_${p2.id}` : `${p2.id}_${p1.id}`;
+      }
+
+      addConstraint(p1, p2) {
+        const key = this.getEdgeKey(p1, p2);
+        if (this.constraintMap.has(key)) return this.constraintMap.get(key);
+        const c = new Constraint(p1, p2);
+        this.constraints.push(c);
+        this.constraintMap.set(key, c);
+        return c;
+      }
+
+      initMesh() {
+        const cols = 24;
+        const rows = 16;
+        const startX = (this.width - (cols * CONFIG.spacing)) / 2;
+
+        for (let y = 0; y < rows; y++) {
+          for (let x = 0; x < cols; x++) {
+            this.points.push(new Point(startX + x * CONFIG.spacing, 60 + y * CONFIG.spacing, y === 0));
+          }
+        }
+
+        for (let y = 0; y < rows - 1; y++) {
+          for (let x = 0; x < cols - 1; x++) {
+            const i = y * cols + x;
+            const p1 = this.points[i];
+            const p2 = this.points[i + 1];
+            const p3 = this.points[i + cols];
+            const p4 = this.points[i + cols + 1];
+
+            this.addConstraint(p1, p2);
+            this.addConstraint(p1, p3);
+            this.addConstraint(p2, p4);
+            this.addConstraint(p3, p4);
+            this.addConstraint(p2, p3);
+
+            this.triangles.push(new Triangle(p1, p2, p3));
+            this.triangles.push(new Triangle(p3, p2, p4));
+          }
+        }
+      }
+
+      splitEdge(p1, p2) {
+        if (Vec2.dist(p1, p2) < CONFIG.minEdgeLength) return null;
+        const key = this.getEdgeKey(p1, p2);
+
+        // GLOBAL HASH CHECK: Reuse existing midpoint if this edge was already split
+        if (this.midpointMap.has(key)) return this.midpointMap.get(key);
+
+        const c = this.constraintMap.get(key);
+
+        // If constraint is missing or inactive (cut), do NOT heal it.
+        if (!c || !c.active) return null;
+
+        // Redundant check for safety, though map check above handles most cases
+        if (c.midpoint) return c.midpoint;
+
+        const mid = new Point((p1.x + p2.x) * 0.5, (p1.y + p2.y) * 0.5);
+        mid.oldx = (p1.oldx + p2.oldx) * 0.5;
+        mid.oldy = (p1.oldy + p2.oldy) * 0.5;
+        this.points.push(mid);
+
+        // Register the new midpoint globally
+        this.midpointMap.set(key, mid);
+
+        c.midpoint = mid;
+        c.active = false;
+
+        this.addConstraint(p1, mid);
+        this.addConstraint(mid, p2);
+
+        return mid;
+      }
+
+      refineMesh(predX, predY) {
+        const targetTriangles = new Set();
+        const start = { x: this.mouse.x, y: this.mouse.y };
+        const end = { x: predX, y: predY };
+
+        const minX = Math.min(start.x, end.x) - CONFIG.refineRadius;
+        const maxX = Math.max(start.x, end.x) + CONFIG.refineRadius;
+        const minY = Math.min(start.y, end.y) - CONFIG.refineRadius;
+        const maxY = Math.max(start.y, end.y) + CONFIG.refineRadius;
+
+        for (const t of this.triangles) {
+          if (!t.active || t.generation >= 3) continue;
+          const c = t.centroid();
+          if (c.x < minX || c.x > maxX || c.y < minY || c.y > maxY) continue;
+
+          if (this.distToSegment(c, start, end) < CONFIG.refineRadius) {
+            targetTriangles.add(t);
+          }
+        }
+
+        if (targetTriangles.size === 0) return;
+
+        let safety = 0;
+        let changed = true;
+        while (changed && safety++ < 4) {
+          changed = false;
+          const current = Array.from(targetTriangles);
+          const brokenEdges = new Set();
+
+          for (const t of current) {
+            brokenEdges.add(this.getEdgeKey(t.p1, t.p2));
+            brokenEdges.add(this.getEdgeKey(t.p2, t.p3));
+            brokenEdges.add(this.getEdgeKey(t.p3, t.p1));
+          }
+
+          for (const t of this.triangles) {
+            if (!t.active || targetTriangles.has(t)) continue;
+            const c = t.centroid();
+            if (c.x < minX - 50 || c.x > maxX + 50 || c.y < minY - 50 || c.y > maxY + 50) continue;
+
+            const e1 = this.getEdgeKey(t.p1, t.p2);
+            const e2 = this.getEdgeKey(t.p2, t.p3);
+            const e3 = this.getEdgeKey(t.p3, t.p1);
+
+            if (brokenEdges.has(e1) || brokenEdges.has(e2) || brokenEdges.has(e3)) {
+              targetTriangles.add(t);
+              changed = true;
+            }
+          }
+        }
+
+        const newTris = [];
+        for (const t of targetTriangles) {
+          const m1 = this.splitEdge(t.p1, t.p2);
+          const m2 = this.splitEdge(t.p2, t.p3);
+          const m3 = this.splitEdge(t.p3, t.p1);
+
+          if (!m1 || !m2 || !m3) continue;
+
+          t.active = false;
+
+          this.addConstraint(m1, m2);
+          this.addConstraint(m2, m3);
+          this.addConstraint(m3, m1);
+
+          const g = t.generation + 1;
+          newTris.push(new Triangle(t.p1, m1, m3, g));
+          newTris.push(new Triangle(m1, t.p2, m2, g));
+          newTris.push(new Triangle(m3, m2, t.p3, g));
+          newTris.push(new Triangle(m1, m2, m3, g));
+        }
+        this.triangles.push(...newTris);
+      }
+
+      cutAt(x, y) {
+        const r2 = CONFIG.cutRadius * CONFIG.cutRadius;
+        for (const c of this.constraints) {
+          if (!c.active) continue;
+          const mx = (c.p1.x + c.p2.x) * 0.5;
+          const my = (c.p1.y + c.p2.y) * 0.5;
+          const distSq = (mx - x) * (mx - x) + (my - y) * (my - y);
+          if (distSq < r2) c.active = false;
+        }
+
+        const minX = x - CONFIG.cutRadius;
+        const maxX = x + CONFIG.cutRadius;
+        const minY = y - CONFIG.cutRadius;
+        const maxY = y + CONFIG.cutRadius;
+
+        // DUST PREVENTION: Remove triangles fully inside the cut radius
+        for (const t of this.triangles) {
+          if (!t.active) continue;
+          const c = t.centroid();
+          if (c.x < minX || c.x > maxX || c.y < minY || c.y > maxY) continue;
+
+          const distSq = (c.x - x) * (c.x - x) + (c.y - y) * (c.y - y);
+          if (distSq < r2) {
+            t.active = false;
+          }
+        }
+      }
+
+      distToSegment(p, v, w) {
+        const l2 = Vec2.dist(v, w) ** 2;
+        if (l2 === 0) return Vec2.dist(p, v);
+        let t = ((p.x - v.x) * (w.x - v.x) + (p.y - v.y) * (w.y - v.y)) / l2;
+        t = Math.max(0, Math.min(1, t));
+        return Vec2.dist(p, { x: v.x + t * (w.x - v.x), y: v.y + t * (w.y - v.y) });
+      }
+
+      bindEvents() {
+        window.addEventListener('resize', () => this.resize());
+        this.c.addEventListener('mousedown', e => {
+          this.mouse.down = true; this.mouse.button = e.button;
+          this.refineMesh(e.clientX, e.clientY);
+          this.cutAt(e.clientX, e.clientY);
+        });
+        window.addEventListener('mouseup', () => this.mouse.down = false);
+
+        // --- UPDATED MOUSEMOVE: INTERPOLATION FIX ---
+        this.c.addEventListener('mousemove', e => {
+          const mx = e.clientX;
+          const my = e.clientY;
+
+          const vx = (mx - this.mouse.x) * 4;
+          const vy = (my - this.mouse.y) * 4;
+
+          if (this.mouse.down && this.mouse.button === 0) {
+            // Calculate distance moved since last frame
+            const dist = Math.hypot(mx - this.mouse.x, my - this.mouse.y);
+
+            // Determine number of steps (e.g., one step every 10 pixels)
+            const steps = Math.ceil(dist / 10);
+
+            // FILL THE GAP: Loop through the space between old mouse and new mouse
+            for (let i = 1; i <= steps; i++) {
+              const t = i / steps;
+              const interpX = lerp(this.mouse.x, mx, t);
+              const interpY = lerp(this.mouse.y, my, t);
+
+              this.refineMesh(interpX, interpY);
+              this.cutAt(interpX, interpY);
+            }
+          } else {
+            this.refineMesh(mx + vx, my + vy);
+          }
+
+          this.mouse.x = mx; this.mouse.y = my;
+        });
+        // ---------------------------------------------
+
+        this.c.addEventListener('contextmenu', e => e.preventDefault());
+      }
+
+      loop() {
+        this.ctx.clearRect(0, 0, this.width, this.height);
+
+        for (const p of this.points) {
+          if (p.pinned) continue;
+          let vx = (p.x - p.oldx) * 0.99;
+          let vy = (p.y - p.oldy) * 0.99;
+          p.oldx = p.x; p.oldy = p.y;
+          p.x += vx; p.y += vy + CONFIG.gravity * 0.0005;
+          if (p.y > this.height) { p.y = this.height; p.oldy = p.y + vy * 0.1; }
+        }
+
+        for (let i = 0; i < CONFIG.physicsIterations; i++) {
+          for (const c of this.constraints) c.solve();
+        }
+
+        for (const t of this.triangles) {
+          if (!t.active) continue;
+
+          const d1 = Vec2.dist(t.p1, t.p2);
+          const d2 = Vec2.dist(t.p2, t.p3);
+          const d3 = Vec2.dist(t.p3, t.p1);
+
+          if (d1 > CONFIG.tearThreshold || d2 > CONFIG.tearThreshold || d3 > CONFIG.tearThreshold) continue;
+
+          const ax = t.p2.x - t.p1.x, ay = t.p2.y - t.p1.y;
+          const bx = t.p3.x - t.p1.x, by = t.p3.y - t.p1.y;
+          let z = ax * by - ay * bx;
+
+          const shade = 0.5 + (Math.abs(z) / 1500);
+
+          const c = t.colorVal * shade;
+          this.ctx.fillStyle = `rgb(${c * 0.2}, ${c * 0.8}, ${c})`;
+          this.ctx.beginPath();
+          this.ctx.moveTo(t.p1.x, t.p1.y);
+          this.ctx.lineTo(t.p2.x, t.p2.y);
+          this.ctx.lineTo(t.p3.x, t.p3.y);
+          this.ctx.fill();
+        }
+
+        document.getElementById('v').innerText = this.points.length;
+        document.getElementById('t').innerText = this.triangles.filter(t => t.active).length;
+
+        requestAnimationFrame(() => this.loop());
+      }
+    }
+    new ClothSim(document.getElementById('c'));
+  </script>
+</body>
+
+</html>
